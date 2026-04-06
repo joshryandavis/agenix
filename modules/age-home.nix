@@ -149,34 +149,45 @@ let
     lib.getExe app;
 
   # Darwin-only wrapper: makes the home-manager launchd agent robust against
-  # cold-boot ordering races. Without this, the agent commonly fails on macOS
-  # because: (1) /nix/store isn't mounted yet when launchd fires the job,
-  # (2) ~/Library/Logs/agenix doesn't exist so launchd can't open the log
-  # files and gives up before ExecStart runs, (3) two activation paths can
-  # race (RunAtLoad + a manual `launchctl kickstart`) and corrupt the
-  # generation directory, (4) SSH identities on a FileVault volume may not
-  # be readable for the first few seconds after login.
+  # cold-boot ordering races on macOS. The strategy is "always try, retry
+  # forever, exit non-zero on any failure so launchd reschedules us".
+  #
+  # Failure modes this handles:
+  #   1. /nix/store not yet mounted when launchd fires the agent at login.
+  #      The macOS nix store lives on a synthetic APFS volume that mounts
+  #      asynchronously and re-mounts after the user session starts (via
+  #      `nix-darwin` reactivation). wait4path blocks until /nix/store and
+  #      our own script path resolve.
+  #   2. ~/Library/Logs/agenix doesn't exist on first run, so launchd can't
+  #      open StandardOutPath/StandardErrorPath and silently refuses to
+  #      start the job.
+  #   3. SSH identities not yet readable. On a FileVault-encrypted volume
+  #      ~/.ssh/id_ed25519 can take a moment to become readable after login;
+  #      we also start ssh-agent and ssh-add the identities so encrypted
+  #      keys can be used for age decryption (age reads SSH identities via
+  #      $SSH_AUTH_SOCK when the key on disk is passphrase-protected).
+  #   4. Concurrent invocations from RunAtLoad + a manual `launchctl
+  #      kickstart`. Two writers cannot share a generation directory.
   darwinWrapper = pkgs.writeShellApplication {
     name = "agenix-home-manager-mount-secrets-darwin";
-    runtimeInputs = with pkgs; [ coreutils ];
+    runtimeInputs = with pkgs; [ coreutils openssh ];
     text = ''
       set -u
 
       log_dir="${config.home.homeDirectory}/Library/Logs/agenix"
       mkdir -p "$log_dir" 2>/dev/null || true
 
-      # Wait for the nix store to be mounted before doing anything that
-      # references a /nix/store path. wait4path is part of the macOS base
-      # system, so we can rely on it being present even before PATH is set.
+      # 1. Wait for the nix store and our own script to actually exist.
+      # wait4path is part of the macOS base system, so it's available even
+      # before PATH is set up.
       if [ -x /bin/wait4path ]; then
         /bin/wait4path /nix/store >/dev/null 2>&1 || true
         /bin/wait4path "${mountingScript}" >/dev/null 2>&1 || true
       fi
 
-      # Serialize concurrent invocations (RunAtLoad + manual kickstart)
-      # so they cannot race on the generation directory. macOS does not
-      # ship flock(1), so we use mkdir as a portable atomic lock primitive
-      # and clean up on exit.
+      # 2. Serialize concurrent invocations using mkdir as a portable
+      # atomic lock primitive (macOS has no flock(1)). Steal the lock if
+      # the holder pid is gone (stale after a crash).
       lock_dir="$log_dir/.activate.lock"
       acquired=0
       for _ in $(seq 1 300); do
@@ -184,7 +195,6 @@ let
           acquired=1
           break
         fi
-        # Steal the lock if the holding pid is gone (stale after a crash).
         if [ -f "$lock_dir/pid" ]; then
           holder=$(cat "$lock_dir/pid" 2>/dev/null || echo "")
           if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
@@ -201,19 +211,62 @@ let
       echo "$$" > "$lock_dir/pid" 2>/dev/null || true
       trap 'rm -rf "$lock_dir" 2>/dev/null || true' EXIT
 
-      # Wait briefly for at least one identity to become readable. On a
-      # FileVault-encrypted volume the SSH key may not be readable for a
-      # second or two after login.
+      # 3. Wait for at least one identity to be readable. We exit non-zero
+      # on timeout so launchd reschedules and tries again — this is the
+      # "always try" property.
       identities=( ${toString cfg.identityPaths} )
-      for _ in 1 2 3 4 5 6 7 8 9 10; do
+      identity_ok=0
+      for _ in $(seq 1 30); do
         for id in "''${identities[@]}"; do
           if [ -r "$id" ]; then
+            identity_ok=1
             break 2
           fi
         done
         sleep 1
       done
+      if [ "$identity_ok" != 1 ]; then
+        echo "[agenix] no readable identity after 30s — will be retried by launchd" >&2
+        exit 1
+      fi
 
+      # 4. Ensure an ssh-agent is available for passphrase-protected keys.
+      # age can decrypt with ~/.ssh/id_ed25519 directly when the key is
+      # plaintext, but if it's encrypted with a passphrase, age delegates
+      # to ssh-agent via $SSH_AUTH_SOCK. We start a per-user agent socket
+      # under the log dir, reuse it across runs, and try to add each
+      # identity. Failures here are non-fatal: if the key is plaintext,
+      # age will read it directly and the agent is unused; if the key is
+      # encrypted and has no agent, we'll exit non-zero from age below
+      # and launchd will retry.
+      agent_env="$log_dir/ssh-agent.env"
+      if [ -f "$agent_env" ]; then
+        # shellcheck disable=SC1090
+        . "$agent_env" >/dev/null 2>&1 || true
+      fi
+      if [ -z "''${SSH_AUTH_SOCK:-}" ] || ! ssh-add -l >/dev/null 2>&1; then
+        if [ "''${SSH_AUTH_SOCK:-}" != "" ] && [ "$(ssh-add -l 2>&1)" = "Error connecting to agent: No such file or directory" ]; then
+          unset SSH_AUTH_SOCK SSH_AGENT_PID
+        fi
+        if [ -z "''${SSH_AUTH_SOCK:-}" ]; then
+          rm -f "$agent_env"
+          ssh-agent -s > "$agent_env" 2>/dev/null || true
+          # shellcheck disable=SC1090
+          . "$agent_env" >/dev/null 2>&1 || true
+        fi
+      fi
+      if [ -n "''${SSH_AUTH_SOCK:-}" ]; then
+        for id in "''${identities[@]}"; do
+          [ -r "$id" ] || continue
+          ssh-add -l 2>/dev/null | grep -q "$(ssh-keygen -lf "$id" 2>/dev/null | awk '{print $2}')" && continue
+          ssh-add "$id" </dev/null >/dev/null 2>&1 || true
+        done
+        export SSH_AUTH_SOCK
+      fi
+
+      # 5. Run the real mounting script. set -e in writeShellApplication
+      # ensures any failure here propagates as a non-zero exit, which
+      # triggers a launchd retry via KeepAlive.SuccessfulExit = false.
       "${mountingScript}"
     '';
   };
